@@ -55,6 +55,25 @@ def input_hash(wall: WallInput, gnomon: GnomonInput, dr: DateRange,
     return sha256_text(canonical_json(payload))
 
 
+def search_input_hash(
+    wall: WallInput,
+    dr: DateRange,
+    direction: tuple[float, float, float],
+    normal_offset: float,
+    search,
+) -> str:
+    """Hash of a search request; changes with every search parameter."""
+    payload = {
+        "v": ALGORITHM_VERSION,
+        "wall_geom": geometry_hash(wall),
+        "range": dr.model_dump(mode="json"),
+        "direction": [round(c, 9) for c in direction],
+        "normal_offset": round(normal_offset, 9),
+        "search": search.model_dump(mode="json"),
+    }
+    return sha256_text(canonical_json(payload))
+
+
 # ------------------------------------------------------------- pipeline --
 
 
@@ -117,7 +136,7 @@ def generate_dial(
     evaluated = engine.evaluate_samples(samples, frame, gnomon, panel, options)
     lines = engine.build_lines(
         wall, evaluated, options, gnomon, frame, panel,
-        options.sample_minutes, tz=tz, gaps=raw_gaps,
+        options.sample_minutes, dr.start, dr.end, tz=tz, gaps=raw_gaps,
     )
 
     # invalid intervals (wall-lit daytime reasons + DST gaps)

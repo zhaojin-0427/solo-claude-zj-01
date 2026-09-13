@@ -119,8 +119,10 @@ def sun_position(dt_utc: datetime, latitude_deg: float,
     tst = _wrap_into(
         time_mins + terms.eot_minutes + 4.0 * (-longitude_deg), 1440.0
     )
-    # Hour angle: positive west of meridian (astronomical convention)
-    ha = 180.0 - tst / 4.0
+    # Hour angle: 15 degrees per hour, NEGATIVE before solar noon (east of
+    # the meridian), positive in the afternoon (astronomical sign used by
+    # the ENU conversion below).
+    ha = tst / 4.0 - 180.0
 
     lat = latitude_deg * RAD
     dec = terms.declination_deg * RAD

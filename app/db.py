@@ -119,8 +119,8 @@ def create_wall(conn: sqlite3.Connection, wall: WallInput) -> dict:
     gh = service.geometry_hash(wall)
     conn.execute(
         "INSERT INTO wall_versions (wall_id, version, geometry_hash, "
-        "geometry_json, created_utc) VALUES (?,?,1,?,?)",
-        (wall_id, gh, _geometry_json(wall), ts),
+        "geometry_json, created_utc) VALUES (?,?,?,?,?)",
+        (wall_id, 1, gh, _geometry_json(wall), ts),
     )
     conn.commit()
     return {

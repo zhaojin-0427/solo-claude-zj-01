@@ -185,6 +185,17 @@ class GenerateOptions(BaseModel):
 
 
 class SearchOptions(BaseModel):
+    time_mode: Literal["solar", "civil"] = "solar"
+    hours: list[int] = Field(
+        default_factory=lambda: list(range(6, 19)),
+        description="hour labels to evaluate (solar or wall-clock)",
+    )
+    season_dates: list[date] = Field(
+        default_factory=lambda: [
+            date(2026, 3, 20), date(2026, 6, 21),
+            date(2026, 9, 22), date(2026, 12, 21),
+        ],
+    )
     candidate_lengths: list[float] = Field(..., min_length=1)
     min_spacing: float = Field(..., gt=0)
     margin: float = Field(0.05, ge=0)

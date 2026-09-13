@@ -12,11 +12,10 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-from . import db, engine, search as search_mod, service
+from . import db, search as search_mod, service
 from .schemas import (
-    DateRange, DialResult, DSTRule, GenerateOptions, GenerateRequest,
-    GnomonInput, Point2, SearchCandidate, SearchOptions, SearchResponse,
-    WallInput,
+    DateRange, DialResult, GenerateOptions, GnomonInput, Point2,
+    SearchOptions, SearchResponse, WallInput,
 )
 
 
@@ -122,24 +121,14 @@ def dial_search(body: SearchBody):
         body.wall, body.date_range, tuple(body.direction),
         body.normal_offset, body.search, full_top=body.full_top,
     )
-    gh = service.geometry_hash(body.wall)
-    from .service import input_hash
-    ih = input_hash(
-        body.wall,
-        GnomonInput_shim(body.direction, body.normal_offset),
-        body.date_range, GenerateOptions(),
+    ih = service.search_input_hash(
+        body.wall, body.date_range, tuple(body.direction),
+        body.normal_offset, body.search,
     )
     return SearchResponse(
-        input_hash=ih, geometry_hash=gh,
+        input_hash=ih,
+        geometry_hash=service.geometry_hash(body.wall),
         candidates=candidates, searched=total,
-    )
-
-
-def GnomonInput_shim(direction, normal_offset):
-    return GnomonInput(
-        base=Point2(x=0.0, y=0.0),
-        direction=tuple(direction), length=1.0,
-        normal_offset=normal_offset,
     )
 
 
@@ -259,9 +248,9 @@ def version_search(wall_id: int, version_id: int, body: WallSearchBody):
             wall, body.date_range, tuple(body.direction),
             body.normal_offset, body.search, full_top=body.full_top,
         )
-        ih = service.input_hash(
-            wall, GnomonInput_shim(body.direction, body.normal_offset),
-            body.date_range, GenerateOptions(),
+        ih = service.search_input_hash(
+            wall, body.date_range, tuple(body.direction),
+            body.normal_offset, body.search,
         )
         return SearchResponse(
             input_hash=ih,

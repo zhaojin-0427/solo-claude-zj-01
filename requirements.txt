@@ -1,0 +1,5 @@
+# Runtime dependencies for the wall-sundial API.
+# Pinned to the versions the service was built and tested with.
+fastapi==0.141.1
+pydantic==2.13.5
+uvicorn==0.52.4

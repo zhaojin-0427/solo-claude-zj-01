@@ -85,8 +85,16 @@ def build_samples(
     tz = TimezoneEngine(wall.standard_offset_minutes, wall.dst)
     in_gap, gaps = _dst_gap_lookup(tz, d0, d1)
     out: list[Sample] = []
-    start = datetime.combine(d0, datetime.min.time()) - timedelta(minutes=180)
-    end = datetime.combine(d1, datetime.min.time()) + timedelta(days=1, hours=3)
+    # Window in UTC that fully covers *local* dates [d0, d1]; the offset
+    # bounds include the DST jump so no instant on either end is missed.
+    off_lo = min(tz.std, tz.std + tz.dst_delta)
+    off_hi = max(tz.std, tz.std + tz.dst_delta)
+    start = datetime.combine(d0, datetime.min.time()) - timedelta(
+        minutes=off_hi + 30
+    )
+    end = datetime.combine(d1, datetime.min.time()) + timedelta(
+        days=1, minutes=-off_lo + 30
+    )
     t = start
     step = timedelta(minutes=step_minutes)
     while t <= end:
@@ -271,19 +279,25 @@ def _segments(ev: list[EvaluatedSample]):
     return segments
 
 
-def _gaps(ev: list[EvaluatedSample], step_minutes: int) -> list[dict]:
-    """Merge consecutive non-ok samples into reason-labelled spans."""
+def _gaps(ev: list[EvaluatedSample], tolerance: timedelta,
+          extent: timedelta) -> list[dict]:
+    """Merge consecutive non-ok, above-horizon samples into reason spans.
+
+    Samples below the horizon simply delimit where a line starts/ends
+    (there is no shadow at all) and are never reported as line gaps.
+    Samples closer in time than ``tolerance`` are one span; hour lines pass
+    ~25 h (one sample per date), season lines 1.5 sampling steps.
+    """
+    GAP_STATUSES = {BEHIND, PARALLEL, OUTSIDE, DST_GAP}
     gaps: list[dict] = []
     cur: dict | None = None
     prev: EvaluatedSample | None = None
     for e in ev:
-        ts = e.sample.utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+        ts = e.sample.utc
         contiguous = (
-            prev is not None
-            and (e.sample.utc - prev.sample.utc)
-            <= timedelta(minutes=step_minutes) * 1.5
+            prev is not None and (ts - prev.sample.utc) <= tolerance
         )
-        if e.status != OK:
+        if e.status in GAP_STATUSES:
             if cur and cur["status"] == e.status and contiguous:
                 cur["end_utc"] = ts
             else:
@@ -292,12 +306,16 @@ def _gaps(ev: list[EvaluatedSample], step_minutes: int) -> list[dict]:
         else:
             cur = None
         prev = e
-    # extend span ends by one step (half-open interval semantics)
-    for g in gaps:
-        end = datetime.strptime(g["end_utc"], "%Y-%m-%dT%H:%M:%SZ")
-        end += timedelta(minutes=step_minutes)
-        g["end_utc"] = end.strftime("%Y-%m-%dT%H:%M:%SZ")
-    return gaps
+    return [
+        {
+            "status": g["status"],
+            "start_utc": g["start_utc"].strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "end_utc": (g["end_utc"] + extent).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            ),
+        }
+        for g in gaps
+    ]
 
 
 def _counts(ev: list[EvaluatedSample]) -> dict:
@@ -319,19 +337,19 @@ def build_lines(
     frame: G.WallFrame,
     panel: list[G.Pt],
     step_minutes: int,
+    d0: date,
+    d1: date,
     tz: TimezoneEngine | None = None,
     gaps: list[tuple[datetime, datetime]] | None = None,
 ) -> list[DialLine]:
     """Build hour and season lines.
 
-    Hour lines are constructed from one exact instant per day per hour
-    (true-solar inversion or civil-clock lookup), so consecutive points are
-    successive dates and connect smoothly; a run of non-ok dates splits the
-    engraved line. Season date lines are sampled finely across their day.
+    Hour lines contain exactly one exact instant per requested *local* date
+    (true-solar inversion or civil-clock lookup), so successive points are
+    successive dates and connect smoothly; a non-ok date breaks the engraved
+    line. Season date lines are sampled finely across their own day only.
     """
-    days = list(daterange(
-        evaluated[0].sample.utc.date(), evaluated[-1].sample.utc.date()
-    ))
+    days = list(daterange(d0, d1))
     if tz is None:
         tz = TimezoneEngine(wall.standard_offset_minutes, wall.dst)
     gaps = gaps if gaps is not None else []
@@ -348,15 +366,28 @@ def build_lines(
                 frame_eps, gaps,
             ))
         label = f"{hour:02d}:00" + ("" if options.time_mode == "solar" else " L")
-        lines.append(_make_line("hour", label, evs, step_minutes, hour=hour))
+        lines.append(_make_line(
+            "hour", label, evs, hour=hour,
+            tolerance=timedelta(hours=25), extent=timedelta(hours=12),
+        ))
 
     # ----- season date lines -----
     for sd in sorted(set(options.season_dates)):
+        # Season curves are only meaningful for dates the caller asked for;
+        # a single-day request must not drag adjacent-season samples in.
+        if not (d0 <= sd <= d1):
+            # month/day may still match an occurrence inside the range
+            occ = [d for d in days if (d.month, d.day) == (sd.month, sd.day)]
+            if not occ:
+                continue
+            sd = occ[0]
         evs = _season_day(
             wall, tz, gnomon, frame, panel, sd, options, step_minutes, gaps
         )
         lines.append(_make_line(
-            "season", sd.strftime("%m-%d"), evs, step_minutes, season_date=sd
+            "season", sd.strftime("%m-%d"), evs, season_date=sd,
+            tolerance=timedelta(minutes=step_minutes) * 1.5,
+            extent=timedelta(minutes=step_minutes),
         ))
     return lines
 
@@ -464,15 +495,13 @@ def _season_day(wall, tz, gnomon, frame, panel, sd: date, options,
                            options.parallel_cos_threshold)
             out.append(ev)
         t += step
-    if options.time_mode == "civil":
-        out = insert_gap_placeholders(wall, out, tz, gaps, None)
     return out
 
 
-def _make_line(kind, label, evs, step_minutes, hour=None,
+def _make_line(kind, label, evs, tolerance, extent, hour=None,
                season_date=None) -> DialLine:
     segments = _segments(evs)
-    gaps = _gaps(evs, step_minutes)
+    gaps = _gaps(evs, tolerance, extent)
     c = _counts(evs)
     broken = len(segments) > 1
     return DialLine(
@@ -494,24 +523,29 @@ def merge_intervals(
     step: timedelta,
     wanted=("sun_behind_wall", "shadow_parallel", "shadow_outside_panel",
             "dst_gap"),
-    max_gap: timedelta = timedelta(hours=14),
 ) -> list[tuple[str, datetime, datetime]]:
-    """Join consecutive same-reason bad samples into one interval.
+    """Join consecutive same-reason bad samples on the regular UTC grid.
 
-    Runs separated by a night (below horizon) longer than ``max_gap`` stay
-    apart, so an "outside panel" morning doesn't merge across midnight with
-    the next afternoon.
+    Every gap longer than 1.5 sampling steps (e.g. the night stretch of
+    below-horizon samples) closes a span, so morning and afternoon
+    outside-panel runs never merge across the night.
     """
     merged: list[list] = []
+    prev: EvaluatedSample | None = None
     for e in samples:
-        if e.status == OK or e.status == BELOW or e.status not in wanted:
-            continue
-        t = e.sample.utc
-        if (merged and merged[-1][0] == e.status
-                and t - merged[-1][2] <= max_gap):
-            merged[-1][2] = t
-        else:
-            merged.append([e.status, t, t])
+        bad = (e.status in wanted and e.status != OK
+               and e.status != BELOW)
+        contiguous = (
+            bad and prev is not None and prev.status == e.status
+            and e.sample.utc - prev.sample.utc <= step * 1.5
+        )
+        if bad:
+            t = e.sample.utc
+            if contiguous:
+                merged[-1][2] = t
+            else:
+                merged.append([e.status, t, t])
+        prev = e
     return [(r, a, b + step) for r, a, b in merged]
 
 

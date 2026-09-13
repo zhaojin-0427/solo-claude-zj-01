@@ -15,7 +15,6 @@ crossing the kept margin) demote a candidate below any clean one.
 from __future__ import annotations
 
 import math
-from datetime import timedelta
 
 from . import engine, geometry as G
 from .schemas import (
@@ -56,10 +55,13 @@ def search_candidates(
     )
 
     coarse = GenerateOptions(
+        time_mode=search.time_mode,
+        hours=list(search.hours),
+        season_dates=list(search.season_dates),
         sample_minutes=search.search_sample_minutes,
         check_min_spacing=search.min_spacing,
     )
-    samples, _, _ = engine.build_samples(
+    samples, tz, raw_gaps = engine.build_samples(
         wall, dr.start, dr.end, search.search_sample_minutes
     )
 
@@ -70,25 +72,41 @@ def search_candidates(
             evaluated = engine.evaluate_samples(
                 samples, frame, gnomon, panel, coarse
             )
-            ok_points = [e.point for e in evaluated if e.status == "ok"]
+            ok_points = [e.point for e in evaluated if e.status == engine.OK]
             above = [e for e in evaluated
                      if e.sample.alt_deg > 0]
-            coverage = len(ok_points) / len(above) if above else 0.0
-            wall_lit = [e for e in above if e.status != "sun_behind_wall"
-                        and e.status != "below_horizon"]
-            readable_of_lit = (
+            # Wall-lit = sun above horizon AND ray actually reaches the wall
+            # plane (not behind / parallel). Readable coverage is measured
+            # against the times the wall is lit, which is the quantity the
+            # dial maker can actually use.
+            wall_lit = [
+                e for e in above
+                if e.status in (engine.OK, engine.OUTSIDE)
+            ]
+            # primary ranking metric: readable share of wall-lit time
+            coverage = (
                 len(ok_points) / len(wall_lit) if wall_lit else 0.0
             )
-            # margin gate: every readable point must respect the margin
-            margin_ok = all(
-                G.point_in_eroded_polygon(p, panel, search.margin)
-                for p in ok_points
-            )
-
+            readable_of_lit = coverage
+            # margin gate: every readable point must respect the margin.
+            # A base with NO readable points is never acceptable
+            # (all(... on empty) is vacuously true), so guard explicitly.
             lines = engine.build_lines(
                 wall, evaluated, coarse, gnomon, frame, panel,
-                search.search_sample_minutes,
+                search.search_sample_minutes, dr.start, dr.end,
+                tz=tz, gaps=raw_gaps,
             )
+            has_lines = any(
+                seg for line in lines for seg in line.segments
+            )
+            if not ok_points:
+                margin_ok = False
+            else:
+                margin_ok = all(
+                    G.point_in_eroded_polygon(p, panel, search.margin)
+                    for p in ok_points
+                )
+
             min_sp, sp_issues = engine.check_spacing(lines, search.min_spacing)
             spacing_ok = len(sp_issues) == 0
             usage = engine.panel_usage(lines, panel)
@@ -102,11 +120,19 @@ def search_candidates(
                     ) else 1
                     for b in boxes
                 )
-                penalties = (
-                    (0 if spacing_ok else 1)
-                    + (0 if margin_ok else 1)
-                    + min(3, label_viol)
-                )
+                # Quality tier reflects the required ordering:
+                # readable coverage first, then spacing, margin and labels.
+                # Only truly unusable designs (no readable time at all) are
+                # demoted to the bottom tier.
+                if coverage <= 0.0 or not has_lines:
+                    tier = 9
+                elif not spacing_ok:
+                    tier = 2
+                elif not margin_ok or label_viol:
+                    tier = 1
+                else:
+                    tier = 0
+                penalties = tier
                 combos.append({
                     "base": base,
                     "length": length,
@@ -139,8 +165,13 @@ def search_candidates(
             gnomon_model = _as_gnomon_model(
                 c["base"], d_hat, c["length"], normal_offset
             )
+            full_options = GenerateOptions(
+                time_mode=search.time_mode,
+                hours=list(search.hours),
+                season_dates=list(search.season_dates),
+            )
             result = generate_dial(
-                wall, gnomon_model, dr, GenerateOptions(),
+                wall, gnomon_model, dr, full_options,
                 label_offset=c["label_offset"],
             )
         out.append(SearchCandidate(
