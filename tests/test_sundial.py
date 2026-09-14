@@ -238,6 +238,20 @@ class TestSearch:
         h3 = service.search_input_hash(w, dr, (0, -1, 0), 0.0, s3)
         assert len({h1, h2, h3}) == 3
 
+    def test_hash_changes_with_full_top(self):
+        dr = DateRange(start=date(2026, 3, 1), end=date(2026, 4, 30))
+        w = berlin_wall(dst=eu_dst())
+        s = SearchOptions(
+            time_mode="civil", candidate_lengths=[0.2, 0.3],
+            min_spacing=0.02, base_grid_step=0.25,
+            search_sample_minutes=60,
+        )
+        h0 = service.search_input_hash(w, dr, (0, -1, 0), 0.0, s, 0)
+        h1 = service.search_input_hash(w, dr, (0, -1, 0), 0.0, s, 1)
+        h1b = service.search_input_hash(w, dr, (0, -1, 0), 0.0, s, 1)
+        assert h0 != h1
+        assert h1 == h1b  # identical complete request stays stable
+
 
 # ------------------------------------------------------------ HTTP + DB --
 
@@ -318,6 +332,41 @@ class TestHTTP:
         body["search"]["min_spacing"] = 0.04
         r2 = client.post("/dial/search", json=body)
         assert r2.json()["input_hash"] != data["input_hash"]
+
+    def test_search_full_top_changes_hash_and_payload(self):
+        base = {
+            "wall": berlin_wall(dst=eu_dst()).model_dump(mode="json"),
+            "date_range": DateRange(
+                start=date(2026, 3, 1), end=date(2026, 4, 30)
+            ).model_dump(mode="json"),
+            "direction": [0, -1, 0],
+            "search": SearchOptions(
+                time_mode="civil", candidate_lengths=[0.2, 0.3],
+                min_spacing=0.02, base_grid_step=0.25,
+                search_sample_minutes=60,
+            ).model_dump(mode="json"),
+        }
+
+        b0 = {**base, "full_top": 0}
+        b1 = {**base, "full_top": 1}
+        r0 = client.post("/dial/search", json=b0)
+        r1 = client.post("/dial/search", json=b1)
+        assert r0.status_code == r1.status_code == 200
+        d0, d1 = r0.json(), r1.json()
+
+        # hashes distinguish the two response shapes
+        assert d0["input_hash"] != d1["input_hash"]
+        assert d0["geometry_hash"] == d1["geometry_hash"]
+
+        # payloads really do differ as full_top promises
+        assert d0["candidates"][0]["result"] is None
+        assert d1["candidates"][0]["result"] is not None
+        assert d1["candidates"][0]["result"]["mode"] == "civil"
+
+        # identical complete request is stable across repeats
+        r1b = client.post("/dial/search", json=b1)
+        assert r1b.json()["input_hash"] == d1["input_hash"]
+        assert r1b.json()["candidates"] == d1["candidates"]
 
     def test_missing_wall_404(self):
         assert client.get("/walls/999999").status_code == 404

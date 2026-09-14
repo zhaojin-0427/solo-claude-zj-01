@@ -123,7 +123,7 @@ def dial_search(body: SearchBody):
     )
     ih = service.search_input_hash(
         body.wall, body.date_range, tuple(body.direction),
-        body.normal_offset, body.search,
+        body.normal_offset, body.search, body.full_top,
     )
     return SearchResponse(
         input_hash=ih,
@@ -250,7 +250,7 @@ def version_search(wall_id: int, version_id: int, body: WallSearchBody):
         )
         ih = service.search_input_hash(
             wall, body.date_range, tuple(body.direction),
-            body.normal_offset, body.search,
+            body.normal_offset, body.search, body.full_top,
         )
         return SearchResponse(
             input_hash=ih,

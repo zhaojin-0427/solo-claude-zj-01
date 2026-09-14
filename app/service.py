@@ -61,8 +61,15 @@ def search_input_hash(
     direction: tuple[float, float, float],
     normal_offset: float,
     search,
+    full_top: int = 3,
 ) -> str:
-    """Hash of a search request; changes with every search parameter."""
+    """Hash of a search request.
+
+    Every parameter that changes the response payload is included: in
+    particular ``full_top`` controls how many candidates carry the full
+    embedded :class:`DialResult`, so requests differing only in ``full_top``
+    must hash differently.
+    """
     payload = {
         "v": ALGORITHM_VERSION,
         "wall_geom": geometry_hash(wall),
@@ -70,6 +77,7 @@ def search_input_hash(
         "direction": [round(c, 9) for c in direction],
         "normal_offset": round(normal_offset, 9),
         "search": search.model_dump(mode="json"),
+        "full_top": int(full_top),
     }
     return sha256_text(canonical_json(payload))
 

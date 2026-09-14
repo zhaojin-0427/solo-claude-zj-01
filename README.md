@@ -90,7 +90,8 @@ SUNDIAL_DB=/path/to/sundial.db python3 -m uvicorn app.main:app --host 127.0.0.1 
 
 `search.time_mode` 取 `solar`/`civil`（civil 按民用钟点排列并标注 DST
 空跳）；`candidate_lengths`、`min_spacing`、`margin`、`base_grid_step`、
-`label_offsets` 均参与 `input_hash`，任一改动哈希即变。
+`label_offsets` 及 `full_top`（决定多少个候选带完整 result）均参与
+`input_hash`，任一改动哈希即变。
 
 排序按：可读时段覆盖（阴影落入面板的样本 / 墙面实际受照样本）→ 最小刻线
 间距 → 面板占用；无任何可读时间的组合沉底。检查项还包括刻线断裂
