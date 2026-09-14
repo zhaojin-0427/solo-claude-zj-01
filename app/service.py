@@ -7,9 +7,10 @@ import json
 from datetime import datetime, timedelta
 
 from . import engine, geometry as G
+from .obstacles import compile_contours
 from .schemas import (
     CheckReport, DateRange, DialResult, DSTEvent, GenerateOptions,
-    GnomonInput, InvalidInterval, WallInput,
+    GnomonInput, InvalidInterval, ObstacleLoss, ObstacleReport, WallInput,
 )
 from .svg_render import render_svg
 from .timezone_engine import TimezoneEngine
@@ -29,7 +30,12 @@ def sha256_text(s: str) -> str:
 
 
 def geometry_hash(wall: WallInput) -> str:
-    """Hash of the engraved geometry only (name excluded)."""
+    """Hash of the engraved geometry only (name excluded).
+
+    Named obstruction skylines are part of the frozen wall geometry. The
+    key is only added when a wall actually carries profiles, so walls
+    without obstacles keep the same hash as before.
+    """
     payload = {
         "lat": round(wall.latitude, 9),
         "lon": round(wall.longitude, 9),
@@ -39,6 +45,16 @@ def geometry_hash(wall: WallInput) -> str:
         "inclination": round(wall.inclination, 9),
         "panel": [(round(p.x, 6), round(p.y, 6)) for p in wall.panel],
     }
+    if wall.obstacles:
+        payload["obstacles"] = [
+            {
+                "name": ob.name,
+                "wrap": ob.wrap,
+                "points": [(round(p.azimuth_deg, 6),
+                            round(p.altitude_deg, 6)) for p in ob.points],
+            }
+            for ob in wall.obstacles
+        ]
     return sha256_text(canonical_json(payload))[:16]
 
 
@@ -131,6 +147,7 @@ def generate_dial(
     options = options or GenerateOptions()
     frame = G.make_frame(wall.azimuth, wall.inclination)
     panel = [(p.x, p.y) for p in wall.panel]
+    profiles = compile_contours(wall)
     gnomon = G.Gnomon(
         base=(gnomon_input.base.x, gnomon_input.base.y),
         direction=tuple(gnomon_input.direction),
@@ -141,10 +158,13 @@ def generate_dial(
     samples, tz, raw_gaps = engine.build_samples(
         wall, dr.start, dr.end, options.sample_minutes
     )
-    evaluated = engine.evaluate_samples(samples, frame, gnomon, panel, options)
+    evaluated = engine.evaluate_samples(
+        samples, frame, gnomon, panel, options, profiles
+    )
     lines = engine.build_lines(
         wall, evaluated, options, gnomon, frame, panel,
         options.sample_minutes, dr.start, dr.end, tz=tz, gaps=raw_gaps,
+        profiles=profiles,
     )
 
     # invalid intervals (wall-lit daytime reasons + DST gaps)
@@ -152,13 +172,14 @@ def generate_dial(
         evaluated, timedelta(minutes=options.sample_minutes)
     )
     invalid: list[InvalidInterval] = []
-    for reason, a, b in merged:
+    for reason, ob_name, a, b in merged:
         invalid.append(InvalidInterval(
             reason=reason,
             start_utc=a.strftime("%Y-%m-%dT%H:%M:%SZ"),
             end_utc=b.strftime("%Y-%m-%dT%H:%M:%SZ"),
             start_local=_format_local(a, tz),
             end_local=_format_local(b, tz),
+            obstacle=ob_name,
         ))
     for ga, gb in raw_gaps:
         invalid.append(InvalidInterval(
@@ -194,11 +215,18 @@ def generate_dial(
     )
 
     coverage = engine.coverage_sweep(
-        wall, frame, gnomon, samples, options
+        wall, frame, gnomon, samples, options, profiles
     )
     coverage["panel_usage"] = engine.panel_usage(lines, panel)
 
-    svg = render_svg(wall, lines, boxes, checks, gnomon_input)
+    obstacle_report = _obstacle_report(
+        samples, frame, profiles,
+        timedelta(minutes=options.sample_minutes), tz,
+        options.parallel_cos_threshold,
+    )
+
+    svg = render_svg(wall, lines, boxes, checks, gnomon_input,
+                     obstacle_report=obstacle_report)
 
     ghash = geometry_hash(wall)
     ihash = input_hash(wall, gnomon_input, dr, options, label_offset)
@@ -212,5 +240,42 @@ def generate_dial(
         checks=checks,
         labels=boxes,
         coverage=coverage,
+        obstacle_report=obstacle_report,
         svg=svg,
+    )
+
+
+def _obstacle_report(samples, frame, profiles, step, tz, eps) -> ObstacleReport | None:
+    """Aggregate blocked samples/spans per named contour on the shared grid."""
+    if not profiles:
+        return None
+    loss = engine.obstacle_loss_sweep(samples, frame, profiles, step, eps)
+    losses: list[ObstacleLoss] = []
+    total_samples = 0
+    total_minutes = 0.0
+    step_min = step.total_seconds() / 60.0
+    for prof in profiles:
+        rec = loss[prof.name]
+        intervals = [
+            InvalidInterval(
+                reason=engine.BLOCKED,
+                start_utc=a.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                end_utc=b.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                start_local=_format_local(a, tz),
+                end_local=_format_local(b, tz),
+                obstacle=prof.name,
+            )
+            for a, b in rec["intervals"]
+        ]
+        minutes = rec["count"] * step_min
+        total_samples += rec["count"]
+        total_minutes += minutes
+        losses.append(ObstacleLoss(
+            name=prof.name, blocked_samples=rec["count"],
+            blocked_minutes=round(minutes, 2), intervals=intervals,
+        ))
+    return ObstacleReport(
+        blocked_samples=total_samples,
+        blocked_minutes=round(total_minutes, 2),
+        losses=losses,
     )

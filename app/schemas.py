@@ -19,7 +19,9 @@ from datetime import date
 from enum import Enum
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel, Field, field_validator, model_serializer, model_validator,
+)
 
 
 # ---------------------------------------------------------------- inputs --
@@ -92,6 +94,57 @@ class DSTRule(BaseModel):
         return self
 
 
+class ObstaclePoint(BaseModel):
+    """One skyline control point: Sun at ``azimuth_deg`` is hidden below
+    ``altitude_deg``.  Azimuth is degrees clockwise from north, ``[0, 360)``;
+    0° and 360° are the same azimuth and 360 is rejected."""
+
+    azimuth_deg: float = Field(..., ge=0.0, lt=360.0)
+    altitude_deg: float = Field(
+        ..., ge=0.0, le=90.0,
+        description="obstacle top edge altitude above the horizon (degrees)",
+    )
+
+
+class ObstacleContour(BaseModel):
+    """Named obstruction skyline (building, eaves, evergreen crown ...).
+
+    Control points must be listed by strictly increasing solar azimuth.
+    With ``wrap=False`` the skyline exists only between the first and last
+    point.  With ``wrap=True`` the closing segment between the last and
+    first point crosses 0° (north): the contour must span the seam, i.e.
+    the first azimuth must be > 0 and the last < 360.
+    """
+
+    name: str = Field(..., min_length=1, max_length=80)
+    points: list[ObstaclePoint] = Field(..., min_length=2)
+    wrap: bool = Field(
+        False,
+        description="closed skyline ring: closing segment crosses 0° azimuth",
+    )
+
+    @model_validator(mode="after")
+    def _check_profile(self):
+        name = self.name.strip()
+        if not name:
+            raise ValueError("obstacle name must not be blank")
+        self.name = name
+        azs = [p.azimuth_deg for p in self.points]
+        for a, b in zip(azs, azs[1:]):
+            if b <= a:
+                raise ValueError(
+                    "obstacle control points must be ordered by strictly "
+                    "increasing solar azimuth (no duplicates)"
+                )
+        if self.wrap:
+            if not (azs[0] > 0.0 and azs[-1] < 360.0):
+                raise ValueError(
+                    "a wrap-around obstacle must span 0°: first azimuth > 0 "
+                    "and last azimuth < 360"
+                )
+        return self
+
+
 class WallInput(BaseModel):
     name: str = Field(..., min_length=1, max_length=120)
     latitude: float = Field(..., ge=-90, le=90)
@@ -110,11 +163,26 @@ class WallInput(BaseModel):
         description="wall tilt: 0 vertical, 90 horizontal up, negative overhang",
     )
     panel: list[Point2] = Field(..., min_length=3)
+    obstacles: list[ObstacleContour] = Field(
+        default_factory=list,
+        description="named obstruction skylines frozen with the wall version",
+    )
 
     @model_validator(mode="after")
     def _check_panel(self):
         if len(self.panel) < 3:
             raise ValueError("panel needs at least 3 vertices")
+        return self
+
+    @model_validator(mode="after")
+    def _check_obstacle_names(self):
+        names = [o.name for o in self.obstacles]
+        dup = {n for n in names if names.count(n) > 1}
+        if dup:
+            raise ValueError(
+                "obstacle names must be unique; duplicated: "
+                + ", ".join(sorted(dup))
+            )
         return self
 
 
@@ -227,6 +295,15 @@ class GenerateRequest(BaseModel):
 # --------------------------------------------------------------- outputs --
 
 
+class ObstacleHitInfo(BaseModel):
+    """Which skyline hides a sample and by how much."""
+
+    name: str
+    azimuth_deg: float
+    profile_altitude_deg: float
+    margin_deg: float
+
+
 class LinePoint(BaseModel):
     date: date
     hour_label: int | None = None
@@ -243,11 +320,18 @@ class LinePoint(BaseModel):
     status: str
     reason: str
     note: str = ""
+    obstacle: ObstacleHitInfo | None = None
     """one of: ok, below_horizon, sun_behind_wall, shadow_parallel,
-    shadow_outside_panel, dst_gap"""
+    shadow_outside_panel, blocked_by_obstacle, dst_gap"""
 
-
-# ---------------------------------------------------------------- outputs --
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        # Omit the obstacle key entirely for requests that carry no
+        # obstruction profiles, keeping legacy payloads byte-identical.
+        data = handler(self)
+        if data.get("obstacle") is None:
+            data.pop("obstacle", None)
+        return data
 
 
 class DialLine(BaseModel):
@@ -263,9 +347,17 @@ class DialLine(BaseModel):
     behind_count: int
     parallel_count: int
     below_count: int
+    blocked_count: int = 0
     gap_count: int
     broken: bool
     gaps: list[dict]
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        if not data.get("blocked_count"):
+            data.pop("blocked_count", None)
+        return data
 
 
 class InvalidInterval(BaseModel):
@@ -274,6 +366,14 @@ class InvalidInterval(BaseModel):
     end_utc: str
     start_local: str
     end_local: str
+    obstacle: str | None = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        if data.get("obstacle") is None:
+            data.pop("obstacle", None)
+        return data
 
 
 class DSTEvent(BaseModel):
@@ -301,6 +401,23 @@ class LabelBox(BaseModel):
     angle_deg: float
 
 
+class ObstacleLoss(BaseModel):
+    """Readable time lost to one named skyline over the date range."""
+
+    name: str
+    blocked_samples: int
+    blocked_minutes: float
+    intervals: list[InvalidInterval]
+
+
+class ObstacleReport(BaseModel):
+    """Aggregate blockage summary for all named obstruction profiles."""
+
+    blocked_samples: int
+    blocked_minutes: float
+    losses: list[ObstacleLoss]
+
+
 class CheckReport(BaseModel):
     broken_lines: list[dict]
     min_spacing: float | None
@@ -321,7 +438,15 @@ class DialResult(BaseModel):
     checks: CheckReport
     labels: list[LabelBox]
     coverage: dict
+    obstacle_report: ObstacleReport | None = None
     svg: str
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        if data.get("obstacle_report") is None:
+            data.pop("obstacle_report", None)
+        return data
 
 
 class SearchCandidate(BaseModel):
@@ -337,7 +462,17 @@ class SearchCandidate(BaseModel):
     label_overlaps: int
     margin_ok: bool
     score: list[float]
+    obstacle_losses: list[ObstacleLoss] | None = None
+    """readable time lost to each skyline (gnomon-independent); omitted when
+    the wall version defines no obstruction profiles"""
     result: "DialResult | None" = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        if not data.get("obstacle_losses"):
+            data.pop("obstacle_losses", None)
+        return data
 
 
 class SearchResponse(BaseModel):

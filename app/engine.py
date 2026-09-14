@@ -12,9 +12,10 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 
 from . import geometry as G
+from .obstacles import CompiledContour, blocking_obstacle
 from .schemas import (
     DialLine, GenerateOptions, LabelBox, LinePoint,
-    Point2, SpacingIssue, WallInput,
+    ObstacleHitInfo, Point2, SpacingIssue, WallInput,
 )
 from .solar import (
     solar_terms, solar_time_minutes, sun_position, utc_for_solar_time,
@@ -25,11 +26,12 @@ BELOW = "below_horizon"
 BEHIND = "sun_behind_wall"
 PARALLEL = "shadow_parallel"
 OUTSIDE = "shadow_outside_panel"
+BLOCKED = "blocked_by_obstacle"
 OK = "ok"
 DST_GAP = "dst_gap"
 
 # status priority when a sample fails for several reasons
-ORDER = [DST_GAP, BELOW, BEHIND, PARALLEL, OUTSIDE]
+ORDER = [DST_GAP, BELOW, BEHIND, PARALLEL, BLOCKED, OUTSIDE]
 
 
 @dataclass(frozen=True)
@@ -175,6 +177,33 @@ class EvaluatedSample:
     sdotn: float | None
     hour_label: int | None = None
     note: str = ""
+    obstacle: "ObstacleHit | None" = None
+    """profile hit for a blocked sample (also kept on blocked-only samples so
+    the original sampling instant stays traceable)"""
+
+
+@dataclass(frozen=True)
+class ObstacleHit:
+    name: str
+    profile_altitude_deg: float
+    margin_deg: float
+
+
+def _to_hit(ob, s: Sample, hit_point: G.Pt | None) -> tuple[ObstacleHit, str]:
+    hit = ObstacleHit(
+        name=ob.name, profile_altitude_deg=ob.profile_altitude_deg,
+        margin_deg=ob.margin_deg,
+    )
+    note = (
+        f"obstacle '{ob.name}' skyline {ob.profile_altitude_deg:.3f}° at az "
+        f"{s.az_deg:.2f}° (margin {ob.margin_deg:.3f}°)"
+    )
+    if hit_point is not None:
+        note += (
+            f"; wall-plane intersection ({hit_point[0]:.3f},"
+            f"{hit_point[1]:.3f})"
+        )
+    return hit, note
 
 
 def evaluate_samples(
@@ -183,7 +212,9 @@ def evaluate_samples(
     gnomon: G.Gnomon,
     panel: list[G.Pt],
     options: GenerateOptions,
+    profiles: list[CompiledContour] | None = None,
 ) -> list[EvaluatedSample]:
+    profiles = profiles or []
     tip = gnomon.tip(frame)
     eps = options.parallel_cos_threshold
     out: list[EvaluatedSample] = []
@@ -191,6 +222,7 @@ def evaluate_samples(
         status = OK
         note = ""
         hit_point: G.Pt | None = None
+        ob_hit: ObstacleHit | None = None
         sdotn = G.dot(s.sun, frame.normal)
         if s.dst_gap:
             status = DST_GAP
@@ -207,21 +239,32 @@ def evaluate_samples(
                 status = BEHIND
             elif hit.status == "shadow_parallel":
                 status = PARALLEL
-            elif hit.status == "ok" and not G.point_in_polygon(hit_point, panel):
-                status = OUTSIDE
             else:
-                status = OK
+                # ray actually meets the wall: only now can a skyline hide
+                # the Sun (a sun behind the wall is not an obstacle loss).
+                ob = blocking_obstacle(profiles, s.az_deg, s.alt_deg)
+                if ob is not None:
+                    status = BLOCKED
+                    ob_hit, ob_note = _to_hit(ob, s, hit_point)
+                elif hit.status == "ok" and not G.point_in_polygon(
+                    hit_point, panel
+                ):
+                    status = OUTSIDE
+                else:
+                    status = OK
             note += f"s·n={hit.sdotn:.4f}"
             if status == OUTSIDE:
                 note += (
                     f"; wall-plane intersection ({hit_point[0]:.3f},"
                     f"{hit_point[1]:.3f}) outside panel"
                 )
+            if ob_hit is not None:
+                note += "; " + ob_note
         out.append(
             EvaluatedSample(
                 sample=s, status=status,
                 point=hit_point if status == OK else None,
-                sdotn=sdotn, note=note.strip(),
+                sdotn=sdotn, note=note.strip(), obstacle=ob_hit,
             )
         )
     return out
@@ -247,6 +290,12 @@ def to_line_point(e: EvaluatedSample) -> LinePoint:
         status=e.status,
         reason=_reason(e),
         note=e.note,
+        obstacle=ObstacleHitInfo(
+            name=e.obstacle.name,
+            azimuth_deg=round(s.az_deg, 4),
+            profile_altitude_deg=round(e.obstacle.profile_altitude_deg, 4),
+            margin_deg=round(e.obstacle.margin_deg, 4),
+        ) if e.obstacle is not None else None,
     )
 
 
@@ -257,6 +306,7 @@ def _reason(e: EvaluatedSample) -> str:
         BEHIND: "sun is behind the wall",
         PARALLEL: "shadow ray parallel to the wall plane",
         OUTSIDE: "intersection with wall plane lies outside the panel",
+        BLOCKED: "sun hidden by an obstruction skyline",
         DST_GAP: "local clock time does not exist (DST gap)",
     }[e.status]
 
@@ -286,9 +336,10 @@ def _gaps(ev: list[EvaluatedSample], tolerance: timedelta,
     Samples below the horizon simply delimit where a line starts/ends
     (there is no shadow at all) and are never reported as line gaps.
     Samples closer in time than ``tolerance`` are one span; hour lines pass
-    ~25 h (one sample per date), season lines 1.5 sampling steps.
+    ~25 h (one sample per date), season lines 1.5 sampling steps. Blocked
+    spans are additionally split by the obstructing contour name.
     """
-    GAP_STATUSES = {BEHIND, PARALLEL, OUTSIDE, DST_GAP}
+    GAP_STATUSES = {BEHIND, PARALLEL, OUTSIDE, DST_GAP, BLOCKED}
     gaps: list[dict] = []
     cur: dict | None = None
     prev: EvaluatedSample | None = None
@@ -297,34 +348,42 @@ def _gaps(ev: list[EvaluatedSample], tolerance: timedelta,
         contiguous = (
             prev is not None and (ts - prev.sample.utc) <= tolerance
         )
+        gap_key = (e.status,
+                   e.obstacle.name if e.status == BLOCKED else None)
         if e.status in GAP_STATUSES:
-            if cur and cur["status"] == e.status and contiguous:
+            if cur and cur["key"] == gap_key and contiguous:
                 cur["end_utc"] = ts
             else:
-                cur = {"status": e.status, "start_utc": ts, "end_utc": ts}
+                cur = {"key": gap_key, "status": e.status,
+                       "obstacle": gap_key[1],
+                       "start_utc": ts, "end_utc": ts}
                 gaps.append(cur)
         else:
             cur = None
         prev = e
-    return [
-        {
+    out = []
+    for g in gaps:
+        item = {
             "status": g["status"],
             "start_utc": g["start_utc"].strftime("%Y-%m-%dT%H:%M:%SZ"),
             "end_utc": (g["end_utc"] + extent).strftime(
                 "%Y-%m-%dT%H:%M:%SZ"
             ),
         }
-        for g in gaps
-    ]
+        if g["obstacle"] is not None:
+            item["obstacle"] = g["obstacle"]
+        out.append(item)
+    return out
 
 
 def _counts(ev: list[EvaluatedSample]) -> dict:
     c = {"sample_count": len(ev), "ok_count": 0, "outside_count": 0,
          "behind_count": 0, "parallel_count": 0, "below_count": 0,
-         "gap_count": 0}
+         "blocked_count": 0, "gap_count": 0}
     for e in ev:
         c[{OK: "ok_count", OUTSIDE: "outside_count", BEHIND: "behind_count",
            PARALLEL: "parallel_count", BELOW: "below_count",
+           BLOCKED: "blocked_count",
            DST_GAP: "gap_count"}[e.status]] += 1
     return c
 
@@ -341,6 +400,7 @@ def build_lines(
     d1: date,
     tz: TimezoneEngine | None = None,
     gaps: list[tuple[datetime, datetime]] | None = None,
+    profiles: list[CompiledContour] | None = None,
 ) -> list[DialLine]:
     """Build hour and season lines.
 
@@ -349,6 +409,7 @@ def build_lines(
     successive dates and connect smoothly; a non-ok date breaks the engraved
     line. Season date lines are sampled finely across their own day only.
     """
+    profiles = profiles or []
     days = list(daterange(d0, d1))
     if tz is None:
         tz = TimezoneEngine(wall.standard_offset_minutes, wall.dst)
@@ -363,7 +424,7 @@ def build_lines(
         for day in days:
             evs.append(_hour_instant(
                 wall, tz, frame, gnomon, panel, day, hour, options,
-                frame_eps, gaps,
+                frame_eps, gaps, profiles,
             ))
         label = f"{hour:02d}:00" + ("" if options.time_mode == "solar" else " L")
         lines.append(_make_line(
@@ -382,7 +443,8 @@ def build_lines(
                 continue
             sd = occ[0]
         evs = _season_day(
-            wall, tz, gnomon, frame, panel, sd, options, step_minutes, gaps
+            wall, tz, gnomon, frame, panel, sd, options, step_minutes, gaps,
+            profiles,
         )
         lines.append(_make_line(
             "season", sd.strftime("%m-%d"), evs, season_date=sd,
@@ -393,7 +455,8 @@ def build_lines(
 
 
 def _hour_instant(wall, tz, frame, gnomon, panel, day: date, hour: int,
-                  options, frame_eps, gaps) -> EvaluatedSample:
+                  options, frame_eps, gaps,
+                  profiles: list[CompiledContour]) -> EvaluatedSample:
     """One exact sample per day for the requested hour."""
     mid = datetime.combine(day, datetime.min.time()) + timedelta(hours=12)
     note_prefix = ""
@@ -428,7 +491,7 @@ def _hour_instant(wall, tz, frame, gnomon, panel, day: date, hour: int,
                 note="wall-clock time skipped by spring-forward transition",
             )
         note_prefix = f"civil clock {hour:02d}:00 -> UTC {utc:%H:%M}; "
-    ev = _classify(sample, frame, gnomon, panel, frame_eps)
+    ev = _classify(sample, frame, gnomon, panel, frame_eps, profiles)
     ev.hour_label = hour
     ev.note = note_prefix + ev.note
     return ev
@@ -450,7 +513,9 @@ def _sample_at(wall, tz: TimezoneEngine, utc: datetime) -> Sample:
     )
 
 
-def _classify(sample: Sample, frame, gnomon, panel, frame_eps) -> EvaluatedSample:
+def _classify(sample: Sample, frame, gnomon, panel, frame_eps,
+              profiles: list[CompiledContour] | None = None) -> EvaluatedSample:
+    profiles = profiles or []
     tip = gnomon.tip(frame)
     sdotn = G.dot(sample.sun, frame.normal)
     if sample.dst_gap:
@@ -471,6 +536,13 @@ def _classify(sample: Sample, frame, gnomon, panel, frame_eps) -> EvaluatedSampl
         return EvaluatedSample(sample, PARALLEL, None, sdotn,
                                note=f"|s·n|={abs(sdotn):.4f}")
     p = hit.point
+    ob = blocking_obstacle(profiles, sample.az_deg, sample.alt_deg)
+    if ob is not None:
+        ob_hit, ob_note = _to_hit(ob, sample, p)
+        return EvaluatedSample(
+            sample, BLOCKED, None, sdotn, obstacle=ob_hit,
+            note=f"s·n={sdotn:.4f}; " + ob_note,
+        )
     if not G.point_in_polygon(p, panel):
         return EvaluatedSample(
             sample, OUTSIDE, None, sdotn,
@@ -481,8 +553,11 @@ def _classify(sample: Sample, frame, gnomon, panel, frame_eps) -> EvaluatedSampl
 
 
 def _season_day(wall, tz, gnomon, frame, panel, sd: date, options,
-                step_minutes, gaps) -> list[EvaluatedSample]:
+                step_minutes, gaps,
+                profiles: list[CompiledContour] | None = None
+                ) -> list[EvaluatedSample]:
     """Fine UTC sampling for one date (season date curves)."""
+    profiles = profiles or []
     start = datetime.combine(sd, datetime.min.time()) - timedelta(hours=1)
     end = start + timedelta(hours=26)
     out: list[EvaluatedSample] = []
@@ -492,7 +567,7 @@ def _season_day(wall, tz, gnomon, frame, panel, sd: date, options,
         s = _sample_at(wall, tz, t)
         if s.alt_deg > -0.5:
             ev = _classify(s, frame, gnomon, panel,
-                           options.parallel_cos_threshold)
+                           options.parallel_cos_threshold, profiles)
             out.append(ev)
         t += step
     return out
@@ -522,31 +597,40 @@ def merge_intervals(
     samples: list[EvaluatedSample],
     step: timedelta,
     wanted=("sun_behind_wall", "shadow_parallel", "shadow_outside_panel",
-            "dst_gap"),
-) -> list[tuple[str, datetime, datetime]]:
+            "blocked_by_obstacle", "dst_gap"),
+) -> list[tuple[str, str | None, datetime, datetime]]:
     """Join consecutive same-reason bad samples on the regular UTC grid.
 
     Every gap longer than 1.5 sampling steps (e.g. the night stretch of
     below-horizon samples) closes a span, so morning and afternoon
-    outside-panel runs never merge across the night.
+    outside-panel runs never merge across the night. Blocked spans carry
+    the obstructing contour name and adjacent runs hidden by different
+    contours are not joined.
     """
     merged: list[list] = []
     prev: EvaluatedSample | None = None
     for e in samples:
         bad = (e.status in wanted and e.status != OK
                and e.status != BELOW)
+        key = (e.status,
+               e.obstacle.name if e.status == BLOCKED else None)
+        prev_key = (
+            (prev.status,
+             prev.obstacle.name if prev.status == BLOCKED else None)
+            if prev is not None else None
+        )
         contiguous = (
-            bad and prev is not None and prev.status == e.status
+            bad and prev is not None and prev_key == key
             and e.sample.utc - prev.sample.utc <= step * 1.5
         )
         if bad:
             t = e.sample.utc
             if contiguous:
-                merged[-1][2] = t
+                merged[-1][3] = t
             else:
-                merged.append([e.status, t, t])
+                merged.append([e.status, key[1], t, t])
         prev = e
-    return [(r, a, b + step) for r, a, b in merged]
+    return [(r, name, a, b + step) for r, name, a, b in merged]
 
 
 # ------------------------------------------------------------ checks ----
@@ -691,13 +775,21 @@ def coverage_sweep(
     gnomon: G.Gnomon,
     samples: list[Sample],
     options: GenerateOptions,
+    profiles: list[CompiledContour] | None = None,
 ) -> dict:
     """Fractions of (a) sun-above-horizon samples and (b) samples whose ray
-    meets the wall at all, that land inside the panel."""
+    meets the wall at all, that land inside the panel.
+
+    With obstruction profiles the *eligible* denominator excludes samples
+    hidden by a skyline while the wall is lit; blocked samples are counted
+    separately per contour so the loss is attributable.
+    """
+    profiles = profiles or []
     tip = gnomon.tip(frame)
     panel = [(p.x, p.y) for p in wall.panel]
     eps = options.parallel_cos_threshold
-    above = wall_hit = readable = 0
+    above = wall_hit = readable = blocked = eligible = 0
+    blocked_by_name: dict[str, int] = {}
     for s in samples:
         if s.alt_deg <= 0:
             continue
@@ -706,9 +798,15 @@ def coverage_sweep(
         if hit.status != "ok" or hit.point is None:
             continue
         wall_hit += 1
+        ob = blocking_obstacle(profiles, s.az_deg, s.alt_deg)
+        if ob is not None:
+            blocked += 1
+            blocked_by_name[ob.name] = blocked_by_name.get(ob.name, 0) + 1
+            continue
+        eligible += 1
         if G.point_in_polygon(hit.point, panel):
             readable += 1
-    return {
+    out = {
         "samples_above_horizon": above,
         "samples_wall_lit": wall_hit,
         "samples_readable": readable,
@@ -717,6 +815,19 @@ def coverage_sweep(
         if wall_hit else 0.0,
         "wall_lit_of_above": round(wall_hit / above, 4) if above else 0.0,
     }
+    if profiles:
+        out.update({
+            "samples_blocked_by_obstacle": blocked,
+            "samples_eligible": eligible,
+            "readable_of_eligible": round(readable / eligible, 4)
+            if eligible else 0.0,
+            "blocked_by_obstacle": [
+                {"name": prof.name,
+                 "blocked_samples": blocked_by_name.get(prof.name, 0)}
+                for prof in profiles
+            ],
+        })
+    return out
 
 
 def panel_usage(lines: list[DialLine], panel: list[G.Pt]) -> float:
@@ -727,3 +838,48 @@ def panel_usage(lines: list[DialLine], panel: list[G.Pt]) -> float:
             total += G.polyline_length([(p.x, p.y) for p in seg])
     side = math.sqrt(G.polygon_area(panel))
     return round(total / side, 4) if side else 0.0
+
+
+# --------------------------------------------------------- obstacle loss --
+
+
+def obstacle_loss_sweep(
+    samples: list[Sample],
+    frame: G.WallFrame,
+    profiles: list[CompiledContour],
+    step: timedelta,
+    eps: float,
+) -> dict:
+    """Blocked samples and merged UTC spans per contour.
+
+    The decision is independent of the gnomon: a sample counts as lost when
+    the Sun is above the horizon, faces the wall (``s·n >= eps``) and its
+    altitude is at or below a profile's interpolated skyline. Consecutive
+    blocked samples (same contour, gap <= 1.5 sampling steps) merge into
+    one span whose end is extended by one step (the sample represents the
+    following interval). Nights and wall-away stretches separate spans.
+    """
+    by_name = {p.name: {"count": 0, "spans": []} for p in profiles}
+    prev_name: str | None = None
+    prev_t: datetime | None = None
+    for s in samples:
+        name = None
+        if s.alt_deg > 0 and G.dot(s.sun, frame.normal) >= eps:
+            hit = blocking_obstacle(profiles, s.az_deg, s.alt_deg)
+            if hit is not None:
+                name = hit.name
+        if name is not None:
+            rec = by_name[name]
+            rec["count"] += 1
+            t = s.utc
+            if (
+                prev_name == name and prev_t is not None
+                and t - prev_t <= step * 1.5
+            ):
+                rec["spans"][-1][1] = t
+            else:
+                rec["spans"].append([t, t])
+        prev_name, prev_t = name, s.utc
+    for rec in by_name.values():
+        rec["intervals"] = [(a, b + step) for a, b in rec.pop("spans")]
+    return by_name

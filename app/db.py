@@ -91,6 +91,10 @@ def _geometry_json(wall: WallInput) -> str:
         "panel": wall.panel.model_dump(mode="json")
         if hasattr(wall.panel, "model_dump") else
         [p.model_dump(mode="json") for p in wall.panel],
+        # named obstruction skylines freeze together with the wall version;
+        # omitted entirely for legacy walls (key absence == empty list)
+        **({"obstacles": [o.model_dump(mode="json") for o in wall.obstacles]}
+           if wall.obstacles else {}),
     })
 
 
@@ -105,6 +109,7 @@ def _row_to_wall_input(name: str, geometry_json: str) -> WallInput:
         azimuth=g["azimuth"],
         inclination=g["inclination"],
         panel=g["panel"],
+        obstacles=g.get("obstacles", []),
     )
 
 

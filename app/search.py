@@ -16,10 +16,13 @@ from __future__ import annotations
 
 import math
 
+from datetime import timedelta
+
 from . import engine, geometry as G
+from .obstacles import blocking_obstacle, compile_contours, sun_faces_wall
 from .schemas import (
-    DateRange, GenerateOptions, Point2, SearchCandidate, SearchOptions,
-    WallInput,
+    DateRange, GenerateOptions, ObstacleLoss, Point2, SearchCandidate,
+    SearchOptions, WallInput,
 )
 from .service import generate_dial
 
@@ -64,28 +67,64 @@ def search_candidates(
     samples, tz, raw_gaps = engine.build_samples(
         wall, dr.start, dr.end, search.search_sample_minutes
     )
+    profiles = compile_contours(wall)
+
+    # Blockage is gnomon-independent, so it is evaluated once on the shared
+    # sample grid: sample i is obstacle-blocked when the wall is lit and a
+    # skyline reaches at least the Sun's altitude. Search coverage is then
+    # measured against the *actually readable* (non-blocked) time.
+    eps = coarse.parallel_cos_threshold
+    step = timedelta(minutes=search.search_sample_minutes)
+    blocked_idx: set[int] = set()
+    if profiles:
+        for i, s in enumerate(samples):
+            if s.alt_deg > 0 and sun_faces_wall(s.sun, frame, eps):
+                if blocking_obstacle(profiles, s.az_deg, s.alt_deg):
+                    blocked_idx.add(i)
+    obstacle_loss_models: list[ObstacleLoss] | None = None
+    if profiles:
+        loss = engine.obstacle_loss_sweep(
+            samples, frame, profiles, step, eps
+        )
+        step_min = search.search_sample_minutes
+        obstacle_loss_models = [
+            ObstacleLoss(
+                name=prof.name,
+                blocked_samples=loss[prof.name]["count"],
+                blocked_minutes=round(
+                    loss[prof.name]["count"] * step_min, 2
+                ),
+                intervals=[],  # spans live in the full results, not search
+            )
+            for prof in profiles
+        ]
 
     combos = []
     for base in bases:
         for length in search.candidate_lengths:
             gnomon = G.Gnomon(base, d_hat, length, normal_offset)
             evaluated = engine.evaluate_samples(
-                samples, frame, gnomon, panel, coarse
+                samples, frame, gnomon, panel, coarse, profiles
             )
             ok_points = [e.point for e in evaluated if e.status == engine.OK]
-            above = [e for e in evaluated
-                     if e.sample.alt_deg > 0]
             # Wall-lit = sun above horizon AND ray actually reaches the wall
             # plane (not behind / parallel). Readable coverage is measured
             # against the times the wall is lit, which is the quantity the
             # dial maker can actually use.
-            wall_lit = [
-                e for e in above
-                if e.status in (engine.OK, engine.OUTSIDE)
-            ]
-            # primary ranking metric: readable share of wall-lit time
+            # Actual readable coverage: both the blocked numerator samples
+            # and the blocked wall-lit denominator samples are removed (a
+            # blocked sample never lands on the panel however the gnomon
+            # is placed), so a gnomon cannot gain rank over time the wall
+            # itself never shows.
+            ok_unblocked = len(ok_points)
+            lit_unblocked = sum(
+                1 for j, e in enumerate(evaluated)
+                if e.sample.alt_deg > 0
+                and e.status in (engine.OK, engine.OUTSIDE)
+                and j not in blocked_idx
+            )
             coverage = (
-                len(ok_points) / len(wall_lit) if wall_lit else 0.0
+                ok_unblocked / lit_unblocked if lit_unblocked else 0.0
             )
             readable_of_lit = coverage
             # margin gate: every readable point must respect the margin.
@@ -94,7 +133,7 @@ def search_candidates(
             lines = engine.build_lines(
                 wall, evaluated, coarse, gnomon, frame, panel,
                 search.search_sample_minutes, dr.start, dr.end,
-                tz=tz, gaps=raw_gaps,
+                tz=tz, gaps=raw_gaps, profiles=profiles,
             )
             has_lines = any(
                 seg for line in lines for seg in line.segments
@@ -145,6 +184,7 @@ def search_candidates(
                     "label_overlaps": len(overlaps),
                     "margin_ok": margin_ok,
                     "penalties": penalties,
+                    "obstacle_losses": obstacle_loss_models,
                 })
 
     # deterministic ordering
@@ -189,6 +229,7 @@ def search_candidates(
             margin_ok=c["margin_ok"],
             score=[c["penalties"], c["coverage"],
                    c["min_spacing"] or 0.0, c["panel_usage"]],
+            obstacle_losses=c["obstacle_losses"],
             result=result,
         ))
     return out, total

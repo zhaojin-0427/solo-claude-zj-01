@@ -37,13 +37,15 @@ def render_svg(
     labels: list[LabelBox],
     checks: CheckReport,
     gnomon: GnomonInput,
+    obstacle_report=None,
 ) -> str:
     poly = [(p.x, p.y) for p in wall.panel]
     minx, miny, maxx, maxy = G.polygon_bbox(poly)
     width_m = maxx - minx
     height_m = maxy - miny
+    extra_strip = 22.0 if obstacle_report is not None else 0.0
     W = width_m * SCALE + 2 * MARGIN
-    H = height_m * SCALE + 2 * MARGIN + 120  # legend strip
+    H = height_m * SCALE + 2 * MARGIN + 120 + extra_strip  # legend strip
 
     def P(x, y):
         return f"{_x(x - minx):.2f},{_y(y - miny, height_m):.2f}"
@@ -168,6 +170,20 @@ def render_svg(
         out.append(
             f'<text x="{MARGIN}" y="{ly+50}" font-size="11" fill="#777">'
             f"unreachable clock times: {escape(gaps)}</text>"
+        )
+    if obstacle_report is not None:
+        # segments are already split at blocked spans; the summary names
+        # the skylines responsible and the total hidden wall-lit time
+        detail = "; ".join(
+            f"{escape(l.name)} {l.blocked_minutes:.0f} min / "
+            f"{l.blocked_samples} samples"
+            for l in obstacle_report.losses if l.blocked_samples
+        ) or "no blocking samples in range"
+        out.append(
+            f'<text x="{MARGIN}" y="{ly+68 + (0 if checks.dst_gap_intervals else -18)}"'
+            f' font-size="11" fill="#7a3b00">'
+            f"blocked by obstacle ({obstacle_report.blocked_minutes:.0f} min "
+            f"total): {detail}</text>"
         )
     out.append("</svg>")
     return "".join(out)
