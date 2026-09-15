@@ -548,9 +548,330 @@ class TestSearch:
         assert h0 != h1
 
 
+# ------------------------------------------------------------- inverse ---
+
+
+def _make_wall_scheme(wall, g, label="inv"):
+    """Create a wall plus a saved scheme; return (wall_id, version_id, scheme_id)."""
+    wid = client.post("/walls", json={"wall": wall.model_dump(mode="json")}).json()["id"]
+    vid = client.get(f"/walls/{wid}/versions").json()[0]["id"]
+    payload = {
+        "date_range": SPRING.model_dump(mode="json"),
+        "gnomon": g.model_dump(mode="json"),
+        "options": GenerateOptions(sample_minutes=20).model_dump(mode="json"),
+        "label": label,
+    }
+    r = client.post(f"/walls/{wid}/versions/{vid}/schemes", json=payload)
+    assert r.status_code == 200, r.text
+    schemes = client.get(f"/walls/{wid}/versions/{vid}/schemes").json()
+    return wid, vid, schemes[-1]["id"]
+
+
+def _season_ok_samples(wall, g, day, sample_minutes=10):
+    res = service.generate_dial(
+        wall, g, DateRange(start=day, end=day),
+        GenerateOptions(sample_minutes=sample_minutes, season_dates=[day]),
+    )
+    season = next(l for l in res.lines if l.kind == "season")
+    return [s for s in season.sample_basis if s.status == "ok"]
+
+
+def _inverse(wid, vid, body):
+    return client.post(f"/walls/{wid}/versions/{vid}/inverse", json=body)
+
+
+class TestInverse:
+    def test_single_point_round_trip(self):
+        wall, g = berlin_wall(), gnomon()
+        wid, vid, sid = _make_wall_scheme(wall, g)
+        s0 = next(s for s in _season_ok_samples(wall, g, date(2026, 3, 20))
+                  if s.utc[11:13] == "10")
+        body = {
+            "scheme_id": sid,
+            "observations": [{"x": s0.shadow.x, "y": s0.shadow.y}],
+            "date": "2026-03-20",
+            "tolerance": 0.005,
+        }
+        r = _inverse(wid, vid, body)
+        assert r.status_code == 200, r.text
+        data = r.json()
+        assert data["matched"] and data["chain_count"] >= 1
+        assert data["wall_id"] == wid and data["scheme_id"] == sid
+        assert data["version"] == 1 and data["version_id"] == vid
+        assert data["precision"]["coarse_step_minutes"] == 10
+        assert data["precision"]["tolerance_m"] == 0.005
+        assert len(data["input_hash"]) == 64
+        obs = data["observations"][0]
+        assert obs["candidate_count"] >= 1
+        best = min(obs["candidates"], key=lambda c: c["residual_m"])
+        dt = abs((datetime.fromisoformat(best["utc"][:-1])
+                  - datetime.fromisoformat(s0.utc[:-1])).total_seconds())
+        assert dt <= 180  # root refinement lands within minutes of truth
+        assert best["residual_m"] <= 0.005
+        assert best["local_clock"].endswith("S")
+        assert best["dst_overlap"] is False
+        assert best["segment"]["date"] == "2026-03-20"
+        assert best["window_start_utc"] <= best["utc"] <= best["window_end_utc"]
+        assert best["solar_time_min"] > 0
+        # matched responses omit the failure key
+        assert "failure" not in data
+
+    def test_multi_point_chain_with_intervals(self):
+        wall, g = berlin_wall(), gnomon()
+        wid, vid, sid = _make_wall_scheme(wall, g)
+        oks = _season_ok_samples(wall, g, date(2026, 3, 20))
+        picks = [next(s for s in oks if s.utc[11:16] == f"{h:02d}:00")
+                 for h in (9, 10, 11)]
+        body = {
+            "scheme_id": sid,
+            "observations": [{"x": s.shadow.x, "y": s.shadow.y}
+                             for s in picks],
+            "date": "2026-03-20",
+            "tolerance": 0.005,
+            "interval_min_minutes": 55,
+            "interval_max_minutes": 65,
+        }
+        data = _inverse(wid, vid, body).json()
+        assert data["matched"], data.get("failure")
+        chain = data["chains"][0]
+        assert len(chain["utc"]) == 3
+        assert chain["candidate_indices"] == [0, 0, 0]
+        for gap in chain["intervals_minutes"]:
+            assert 55 <= gap <= 65
+            assert abs(gap - 60.0) < 1.0
+        for got, want in zip(chain["utc"], picks):
+            dt = abs((datetime.fromisoformat(got[:-1])
+                      - datetime.fromisoformat(want.utc[:-1])).total_seconds())
+            assert dt <= 180
+
+    def test_self_intersection_keeps_multiple_solutions(self):
+        # one point, searched over five days: the daily trajectories all
+        # pass through the same neighbourhood (analemma-style revisit)
+        wall, g = berlin_wall(), gnomon()
+        wid, vid, sid = _make_wall_scheme(wall, g)
+        s0 = next(s for s in _season_ok_samples(wall, g, date(2026, 3, 20))
+                  if s.utc[11:13] == "10")
+        body = {
+            "scheme_id": sid,
+            "observations": [{"x": s0.shadow.x, "y": s0.shadow.y}],
+            "date_range": {"start": "2026-03-18", "end": "2026-03-22"},
+            "tolerance": 0.02,
+        }
+        data = _inverse(wid, vid, body).json()
+        obs = data["observations"][0]
+        assert obs["candidate_count"] >= 3
+        days = {c["utc"][:10] for c in obs["candidates"]}
+        assert len(days) >= 3
+        segs = {c["segment"]["index"] for c in obs["candidates"]}
+        assert len(segs) == obs["candidate_count"]
+        utcs = [c["utc"] for c in obs["candidates"]]
+        assert utcs == sorted(utcs)
+        assert all(c["residual_m"] <= 0.02 for c in obs["candidates"])
+        # every candidate is a valid single-observation chain
+        assert data["chain_count"] == obs["candidate_count"]
+
+    def test_dst_overlap_candidates_flagged(self):
+        # custom rule: clocks fall back 14:00 -> 13:00 on 2026-06-27, so
+        # local 13:xx happens twice in daylight
+        noon_dst = DSTRule(
+            mode="fixed", start_month=6, start_day=20, start_at_local="14:00",
+            end_month=6, end_day=27, end_at_local="14:00",
+            dst_offset_minutes=60,
+        )
+        wall = WallInput(
+            name="summer wall", latitude=52.52, longitude=13.40,
+            standard_offset_minutes=60, dst=noon_dst,
+            azimuth=180, inclination=0,
+            panel=[Point2(x=-2, y=-1), Point2(x=2, y=-1),
+                   Point2(x=2, y=2), Point2(x=-2, y=2)],
+        )
+        g = GnomonInput(base=Point2(x=0.0, y=1.0), direction=(0, -1, 0),
+                        length=0.5)
+        wid, vid, sid = _make_wall_scheme(wall, g)
+        s0 = next(s for s in _season_ok_samples(wall, g, date(2026, 6, 27))
+                  if s.utc[11:16] == "11:30")
+        assert s0.local_clock.endswith("D")
+        body = {
+            "scheme_id": sid,
+            "observations": [{"x": s0.shadow.x, "y": s0.shadow.y}],
+            "date": "2026-06-27",
+            "tolerance": 0.005,
+        }
+        data = _inverse(wid, vid, body).json()
+        assert data["matched"]
+        best = min(data["observations"][0]["candidates"],
+                   key=lambda c: c["residual_m"])
+        assert best["utc"].startswith("2026-06-27T11:")
+        assert best["dst"] is True
+        assert best["dst_overlap"] is True
+        assert best["local_clock"] == "2026-06-27T13:30D"
+
+    def test_obstacle_rule_excludes_blocked_times(self):
+        wall = berlin_wall().model_copy(update={"obstacles": [hedge(40)]})
+        g = gnomon()
+        wid, vid, sid = _make_wall_scheme(wall, g)
+        day = date(2026, 3, 20)
+        oks = _season_ok_samples(wall, g, day)
+        assert oks
+        s0 = oks[0]
+        res = service.generate_dial(
+            wall, g, DateRange(start=day, end=day),
+            GenerateOptions(sample_minutes=10, season_dates=[day]),
+        )
+        blocked = [(iv.start_utc, iv.end_utc) for iv in res.invalid_intervals
+                   if iv.reason == "blocked_by_obstacle"]
+        assert blocked
+        body = {
+            "scheme_id": sid,
+            "observations": [{"x": s0.shadow.x, "y": s0.shadow.y}],
+            "date": "2026-03-20",
+            "tolerance": 0.03,
+        }
+        data = _inverse(wid, vid, body).json()
+        assert data["matched"]
+        for c in data["observations"][0]["candidates"]:
+            assert not any(a <= c["utc"] < b for a, b in blocked)
+
+    def test_no_match_reports_first_observation_reasons(self):
+        wall, g = berlin_wall(), gnomon()
+        wid, vid, sid = _make_wall_scheme(wall, g)
+        body = {
+            "scheme_id": sid,
+            "observations": [{"x": 5.0, "y": 5.0}],
+            "date": "2026-03-20",
+            "tolerance": 0.01,
+        }
+        data = _inverse(wid, vid, body).json()
+        assert data["matched"] is False
+        assert data["chains"] == []
+        obs = data["observations"][0]
+        assert obs["candidate_count"] == 0
+        assert obs["nearest_distance_m"] > 0.01
+        assert obs["nearest_utc"]
+        failure = data["failure"]
+        assert failure["observation_index"] == 0
+        assert any("tolerance" in r for r in failure["reasons"])
+        assert any("nearest readable shadow" in r for r in failure["reasons"])
+
+    def test_chain_mismatch_locates_first_observation(self):
+        wall, g = berlin_wall(), gnomon()
+        wid, vid, sid = _make_wall_scheme(wall, g)
+        oks = _season_ok_samples(wall, g, date(2026, 3, 20))
+        picks = [next(s for s in oks if s.utc[11:16] == f"{h:02d}:00")
+                 for h in (10, 12)]
+        body = {
+            "scheme_id": sid,
+            "observations": [{"x": s.shadow.x, "y": s.shadow.y}
+                             for s in picks],
+            "date": "2026-03-20",
+            "tolerance": 0.005,
+            "interval_min_minutes": 55,
+            "interval_max_minutes": 65,  # truth is 120 min apart
+        }
+        data = _inverse(wid, vid, body).json()
+        assert data["matched"] is False
+        assert data["observations"][0]["candidate_count"] >= 1
+        assert data["observations"][1]["candidate_count"] >= 1
+        failure = data["failure"]
+        assert failure["observation_index"] == 0
+        assert failure["chain_failures"]
+        cf = failure["chain_failures"][0]
+        assert cf["failed_at_observation"] == 1
+        assert "observation 1" in cf["reason"]
+
+    def test_validation_rejects_bad_requests(self):
+        wall, g = berlin_wall(), gnomon()
+        wid, vid, sid = _make_wall_scheme(wall, g)
+        base = {
+            "scheme_id": sid,
+            "observations": [{"x": 0.1, "y": 0.2}],
+            "date": "2026-03-20",
+            "tolerance": 0.01,
+        }
+        # both date and date_range
+        bad = {**base, "date_range": {"start": "2026-03-20",
+                                      "end": "2026-03-21"}}
+        assert _inverse(wid, vid, bad).status_code == 422
+        # neither date nor date_range
+        bad = {k: v for k, v in base.items() if k != "date"}
+        assert _inverse(wid, vid, bad).status_code == 422
+        # interval bounds must come as a pair, min <= max
+        bad = {**base, "interval_min_minutes": 30}
+        assert _inverse(wid, vid, bad).status_code == 422
+        bad = {**base, "interval_min_minutes": 90,
+               "interval_max_minutes": 30}
+        assert _inverse(wid, vid, bad).status_code == 422
+        # two observations require the adjacent-observation interval
+        bad = {**base, "observations": [{"x": 0.1, "y": 0.2},
+                                        {"x": 0.2, "y": 0.3}]}
+        assert _inverse(wid, vid, bad).status_code == 422
+        # empty observation list / non-positive tolerance
+        bad = {**base, "observations": []}
+        assert _inverse(wid, vid, bad).status_code == 422
+        bad = {**base, "tolerance": 0}
+        assert _inverse(wid, vid, bad).status_code == 422
+        # unknown references
+        assert _inverse(wid, vid, {**base, "scheme_id": 999999}
+                        ).status_code == 404
+        assert client.post(
+            f"/walls/999999/versions/{vid}/inverse", json=base
+        ).status_code == 404
+        assert client.post(
+            f"/walls/{wid}/versions/999999/inverse", json=base
+        ).status_code == 404
+
+    def test_scheme_from_other_version_rejected(self):
+        wall, g = berlin_wall(), gnomon()
+        wid, vid1, sid = _make_wall_scheme(wall, g)
+        changed = wall.model_dump(mode="json")
+        changed["azimuth"] = 200
+        u = client.put(f"/walls/{wid}", json={"wall": changed})
+        assert u.json()["created_new_version"] is True
+        vid2 = client.get(f"/walls/{wid}/versions").json()[-1]["id"]
+        body = {
+            "scheme_id": sid,
+            "observations": [{"x": 0.1, "y": 0.2}],
+            "date": "2026-03-20",
+            "tolerance": 0.01,
+        }
+        r = _inverse(wid, vid2, body)
+        assert r.status_code == 422
+        assert "belongs to wall version" in r.text
+        # the same scheme on its own version is accepted
+        assert _inverse(wid, vid1, body).status_code == 200
+
+    def test_deterministic_and_scheme_untouched(self):
+        wall, g = berlin_wall(), gnomon()
+        wid, vid, sid = _make_wall_scheme(wall, g)
+        oks = _season_ok_samples(wall, g, date(2026, 3, 20))
+        picks = [next(s for s in oks if s.utc[11:16] == f"{h:02d}:00")
+                 for h in (9, 10)]
+        body = {
+            "scheme_id": sid,
+            "observations": [{"x": s.shadow.x, "y": s.shadow.y}
+                             for s in picks],
+            "date": "2026-03-20",
+            "tolerance": 0.005,
+            "interval_min_minutes": 55,
+            "interval_max_minutes": 65,
+        }
+        d1 = _inverse(wid, vid, body).json()
+        d2 = _inverse(wid, vid, body).json()
+        assert d1 == d2  # same request -> byte-identical result
+        # tolerance and observation order both feed the input hash
+        d3 = _inverse(wid, vid, {**body, "tolerance": 0.01}).json()
+        assert d3["input_hash"] != d1["input_hash"]
+        swapped = {**body, "observations": body["observations"][::-1]}
+        d4 = _inverse(wid, vid, swapped).json()
+        assert d4["input_hash"] != d1["input_hash"]
+        # the stored scheme and wall version are not rewritten by solving
+        schemes = client.get(f"/walls/{wid}/versions/{vid}/schemes").json()
+        assert len(schemes) == 1
+        assert schemes[0]["id"] == sid
+        assert len(client.get(f"/walls/{wid}/versions").json()) == 1
+
+
 # ------------------------------------------------------------ HTTP + DB --
-
-
 class TestHTTP:
     def test_health(self):
         r = client.get("/health")

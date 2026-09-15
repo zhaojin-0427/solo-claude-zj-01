@@ -15,6 +15,8 @@ Geometry convention
 
 from __future__ import annotations
 
+import datetime as _dt
+import math
 from datetime import date
 from enum import Enum
 from typing import Literal
@@ -292,6 +294,75 @@ class GenerateRequest(BaseModel):
     options: GenerateOptions = Field(default_factory=GenerateOptions)
 
 
+# --------------------------------------------------------- inverse solve --
+
+
+class InverseSolveOptions(BaseModel):
+    """Tuning knobs for the measured-shadow inverse lookup.
+
+    ``coarse_step_minutes`` is the UTC grid used to locate brackets; the
+    root refinement (bisection / golden-section) stops at
+    ``root_epsilon_seconds``.  Features narrower than the coarse step can be
+    missed, so both values are reported back as the search precision.
+    """
+
+    coarse_step_minutes: int = Field(10, ge=1, le=60)
+    root_epsilon_seconds: float = Field(2.0, gt=0, le=300)
+    max_candidates_per_observation: int = Field(64, ge=1, le=200)
+    max_chains: int = Field(10, ge=1, le=100)
+
+
+class InverseSolveRequest(BaseModel):
+    """Measured-shadow inverse lookup against a stored wall version + scheme.
+
+    ``observations`` are panel coordinates in chronological order; exactly
+    one of ``date`` / ``date_range`` bounds the search.  With two or more
+    observations the admissible interval between adjacent observations
+    (minutes) is required so candidate chains can be filtered consistently.
+    """
+
+    scheme_id: int = Field(..., ge=1)
+    observations: list[Point2] = Field(..., min_length=1, max_length=50)
+    # ``date`` shadows the datetime type in the class namespace, so the
+    # annotation must qualify it through the module alias
+    date: _dt.date | None = None
+    date_range: DateRange | None = None
+    tolerance: float = Field(
+        ..., gt=0, le=1.0,
+        description="coordinate tolerance of each observation (m)",
+    )
+    interval_min_minutes: float | None = Field(None, gt=0, le=10080)
+    interval_max_minutes: float | None = Field(None, gt=0, le=10080)
+    options: InverseSolveOptions = Field(default_factory=InverseSolveOptions)
+
+    @model_validator(mode="after")
+    def _check_inverse(self):
+        if (self.date is None) == (self.date_range is None):
+            raise ValueError("exactly one of date / date_range is required")
+        for o in self.observations:
+            if not (math.isfinite(o.x) and math.isfinite(o.y)):
+                raise ValueError("observation coordinates must be finite")
+        lo, hi = self.interval_min_minutes, self.interval_max_minutes
+        if (lo is None) != (hi is None):
+            raise ValueError(
+                "interval_min_minutes and interval_max_minutes must be "
+                "given together"
+            )
+        if lo is not None and lo > hi:
+            raise ValueError(
+                "interval_min_minutes exceeds interval_max_minutes"
+            )
+        if len(self.observations) >= 2 and lo is None:
+            raise ValueError(
+                "adjacent-observation interval is required with two or "
+                "more observations"
+            )
+        return self
+
+    def effective_range(self) -> "DateRange":
+        return self.date_range or DateRange(start=self.date, end=self.date)
+
+
 # --------------------------------------------------------------- outputs --
 
 
@@ -480,6 +551,94 @@ class SearchResponse(BaseModel):
     geometry_hash: str
     candidates: list[SearchCandidate]
     searched: int
+
+
+# --------------------------------------------------- inverse solve out --
+
+
+class TrajectorySegmentRef(BaseModel):
+    """One continuous readable stretch of the shadow trajectory."""
+
+    index: int
+    date: date
+    start_utc: str
+    end_utc: str
+
+
+class InverseCandidate(BaseModel):
+    """One instant whose shadow falls within tolerance of the observation."""
+
+    utc: str
+    local_clock: str
+    solar_time_min: float
+    dst: bool
+    dst_overlap: bool
+    """the civil reading also occurs at another UTC instant (fall-back)"""
+    residual_m: float
+    point: Point2
+    segment: TrajectorySegmentRef
+    window_start_utc: str
+    window_end_utc: str
+    """root-refined interval during which the shadow stays within tolerance"""
+
+
+class InverseObservationResult(BaseModel):
+    index: int
+    observed: Point2
+    candidate_count: int
+    truncated: bool
+    nearest_distance_m: float | None
+    nearest_utc: str | None
+    candidates: list[InverseCandidate]
+
+
+class InverseChain(BaseModel):
+    """One consistent time chain: one candidate per observation, in order."""
+
+    candidate_indices: list[int]
+    utc: list[str]
+    intervals_minutes: list[float]
+    total_residual_m: float
+
+
+class InverseChainFailure(BaseModel):
+    """Why one first-observation candidate cannot be extended to a chain."""
+
+    first_candidate_utc: str
+    failed_at_observation: int
+    reason: str
+
+
+class InverseFailure(BaseModel):
+    """Diagnostics when no consistent chain matches; centred on the first
+    observation."""
+
+    observation_index: int
+    reasons: list[str]
+    chain_failures: list[InverseChainFailure]
+
+
+class InverseSolveResponse(BaseModel):
+    input_hash: str
+    geometry_hash: str
+    algorithm_version: str
+    wall_id: int
+    version: int
+    version_id: int
+    scheme_id: int
+    matched: bool
+    chain_count: int
+    precision: dict
+    observations: list[InverseObservationResult]
+    chains: list[InverseChain]
+    failure: InverseFailure | None = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        if data.get("failure") is None:
+            data.pop("failure", None)
+        return data
 
 
 class SelectedScheme(BaseModel):

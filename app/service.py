@@ -98,6 +98,44 @@ def search_input_hash(
     return sha256_text(canonical_json(payload))
 
 
+def inverse_input_hash(
+    wall: WallInput,
+    gnomon: GnomonInput,
+    scheme_id: int,
+    observations,
+    dr: DateRange,
+    tolerance: float,
+    interval_min_minutes: float | None,
+    interval_max_minutes: float | None,
+    options,
+    parallel_cos_threshold: float,
+) -> str:
+    """Hash of an inverse-solve request (measured shadow -> time).
+
+    Everything that influences the response is included: the frozen wall
+    geometry, the referenced scheme and its gnomon, the ordered observation
+    coordinates, the search window, tolerance, interval bounds and the
+    solver precision knobs.  Observation order matters, so swapping two
+    points changes the hash.
+    """
+    payload = {
+        "v": ALGORITHM_VERSION,
+        "kind": "inverse_solve",
+        "wall_geom": geometry_hash(wall),
+        "scheme_id": int(scheme_id),
+        "gnomon": gnomon.model_dump(mode="json"),
+        "observations": [[round(o.x, 9), round(o.y, 9)]
+                         for o in observations],
+        "range": dr.model_dump(mode="json"),
+        "tolerance": round(tolerance, 9),
+        "interval_min_minutes": interval_min_minutes,
+        "interval_max_minutes": interval_max_minutes,
+        "options": options.model_dump(mode="json"),
+        "parallel_cos_threshold": round(parallel_cos_threshold, 9),
+    }
+    return sha256_text(canonical_json(payload))
+
+
 # ------------------------------------------------------------- pipeline --
 
 

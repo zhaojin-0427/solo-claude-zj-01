@@ -12,10 +12,10 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-from . import db, search as search_mod, service
+from . import db, inverse as inverse_mod, search as search_mod, service
 from .schemas import (
-    DateRange, DialResult, GenerateOptions, GnomonInput, Point2,
-    SearchOptions, SearchResponse, WallInput,
+    DateRange, DialResult, GenerateOptions, GnomonInput, InverseSolveRequest,
+    InverseSolveResponse, Point2, SearchOptions, SearchResponse, WallInput,
 )
 
 
@@ -256,6 +256,42 @@ def version_search(wall_id: int, version_id: int, body: WallSearchBody):
             input_hash=ih,
             geometry_hash=service.geometry_hash(wall),
             candidates=candidates, searched=total,
+        )
+    finally:
+        conn.close()
+
+
+# -------------------------------------------------------------- inverse --
+
+
+@app.post("/walls/{wall_id}/versions/{version_id}/inverse",
+          response_model=InverseSolveResponse)
+def version_inverse(wall_id: int, version_id: int, body: InverseSolveRequest):
+    """Inverse lookup: measured shadow points -> candidate times.
+
+    Reads the immutable wall version and the referenced gnomon scheme; the
+    scheme and the wall version are never modified by the solve.
+    """
+    conn = get_conn()
+    try:
+        vrow, wall = _version_or_404(conn, wall_id, version_id)
+        scheme = db.get_scheme(conn, body.scheme_id)
+        if scheme is None:
+            raise HTTPException(404, "scheme not found")
+        if scheme["wall_version_id"] != version_id:
+            raise HTTPException(
+                422,
+                f"scheme {body.scheme_id} belongs to wall version "
+                f"{scheme['wall_version_id']}, not version {version_id}",
+            )
+        gnomon = GnomonInput(
+            base=Point2(**json.loads(scheme["base_json"])),
+            direction=tuple(json.loads(scheme["direction_json"])),
+            length=scheme["length"],
+            normal_offset=scheme["normal_offset"],
+        )
+        return inverse_mod.solve_inverse(
+            wall, wall_id, vrow, scheme, gnomon, body
         )
     finally:
         conn.close()

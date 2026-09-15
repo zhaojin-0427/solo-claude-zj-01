@@ -68,6 +68,7 @@ SUNDIAL_DB=/path/to/sundial.db python3 -m uvicorn app.main:app --host 127.0.0.1 
 | POST | `/walls/{id}/versions/{vid}/search` | 按版本搜索 |
 | POST | `/walls/{id}/versions/{vid}/schemes` | 保存选定方案 |
 | GET | `/walls/{id}/versions/{vid}/schemes` / `/schemes/{id}` | 方案查询 |
+| POST | `/walls/{id}/versions/{vid}/inverse` | 实测阴影坐标反查时间（引用版本与方案，只读） |
 
 ### 生成请求示例
 
@@ -117,6 +118,34 @@ SUNDIAL_DB=/path/to/sundial.db python3 -m uvicorn app.main:app --host 127.0.0.1 
 与分钟数（与晷针无关，同墙所有候选一致）。检查项还包括刻线断裂
 （`broken_lines`）、小时线间距过小（`spacing_issues`）、标签包围盒重叠
 （`label_overlaps`）、边距与 DST 事件。
+
+### 反查请求要点（`/versions/{vid}/inverse`）
+
+请求体引用**已保存方案**（`scheme_id`，晷针随之冻结）与路径中的不可变墙面版本，
+提交按时间先后排列的面板坐标 `observations`、观测日期 `date` **或** `date_range`
+（二选一）、坐标容差 `tolerance`（米）以及相邻观测的时间间隔
+`interval_min_minutes`/`interval_max_minutes`（两个及以上观测时必填，成对出现且
+min ≤ max）。引用校验：墙面/版本不存在返回 404，方案不存在返回 404，方案属于
+其他版本返回 422。
+
+求解分两阶段（`app/inverse.py`）：先按 `options.coarse_step_minutes`（默认 10
+分钟）在 UTC 网格上粗扫，定位每段连续可读轨迹进入容差圆盘的区间；再在连续阴影
+轨迹上求根——二分求 `|P(t) − q| = tolerance` 的入/出根（轨迹段端点处改求状态
+边界根），黄金分割细化得到最近接近时刻。所有不可读规则与正向生成完全一致
+（`engine._classify`）：夏令时春跳、太阳在墙后、阴影平行、越出面板、遮挡轮廓
+命中的时刻都从轨迹中剔除。
+
+每个观测返回**全部**候选：UTC、民用时（`local_clock`，D/S 后缀）、真太阳时
+（`solar_time_min`）、坐标残差 `residual_m`、对应轨迹段 `segment`（序号/日期/
+起止）及容差窗口 `window_start/end_utc`；落在秋令时重叠小时的候选带
+`dst_overlap: true`（同一民用读数对应两个 UTC）。单点落在自交轨迹附近（如不同
+日期同一阴影位置）时多解全部保留。多点请求按点序与间隔筛选一致时间链
+（`chains`，按总残差排序）；无法匹配时 `failure` 定位首个观测并列出排除原因
+（最近接近距离与时刻、范围内各状态样本统计、每个首观测候选无法延伸的环节）。
+
+响应带 `precision`（粗扫步长、求根精度、容差）、`input_hash`（含观测顺序）、
+`geometry_hash` 与来源版本（`wall_id`/`version`/`version_id`/`scheme_id`）。
+求解是纯函数：同一请求结果固定，方案与墙面版本不会被改写。
 
 ### 不可读时段状态
 
